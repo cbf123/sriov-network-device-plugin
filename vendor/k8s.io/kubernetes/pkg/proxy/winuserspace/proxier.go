@@ -92,8 +92,8 @@ type Proxier struct {
 	hostIP         net.IP
 }
 
-// assert Proxier is a ProxyProvider
-var _ proxy.ProxyProvider = &Proxier{}
+// assert Proxier is a proxy.Provider
+var _ proxy.Provider = &Proxier{}
 
 // A key for the portMap.  The ip has to be a string because slices can't be map
 // keys.
@@ -442,6 +442,22 @@ func (proxier *Proxier) OnServiceDelete(service *v1.Service) {
 }
 
 func (proxier *Proxier) OnServiceSynced() {
+}
+
+func (proxier *Proxier) OnEndpointsAdd(endpoints *v1.Endpoints) {
+	proxier.loadBalancer.OnEndpointsAdd(endpoints)
+}
+
+func (proxier *Proxier) OnEndpointsUpdate(oldEndpoints, endpoints *v1.Endpoints) {
+	proxier.loadBalancer.OnEndpointsUpdate(oldEndpoints, endpoints)
+}
+
+func (proxier *Proxier) OnEndpointsDelete(endpoints *v1.Endpoints) {
+	proxier.loadBalancer.OnEndpointsDelete(endpoints)
+}
+
+func (proxier *Proxier) OnEndpointsSynced() {
+	proxier.loadBalancer.OnEndpointsSynced()
 }
 
 func sameConfig(info *serviceInfo, service *v1.Service, protocol v1.Protocol, listenPort int) bool {

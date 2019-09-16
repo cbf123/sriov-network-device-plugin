@@ -25,10 +25,12 @@ import (
 
 	"k8s.io/klog"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/kubernetes/pkg/proxy/metrics"
 	utilproxy "k8s.io/kubernetes/pkg/proxy/util"
 	utilnet "k8s.io/utils/net"
 )
@@ -127,6 +129,7 @@ func (ect *EndpointChangeTracker) Update(previous, current *v1.Endpoints) bool {
 	if endpoints == nil {
 		return false
 	}
+	metrics.EndpointChangesTotal.Inc()
 	namespacedName := types.NamespacedName{Namespace: endpoints.Namespace, Name: endpoints.Name}
 
 	ect.lock.Lock()
@@ -138,10 +141,11 @@ func (ect *EndpointChangeTracker) Update(previous, current *v1.Endpoints) bool {
 		change.previous = ect.endpointsToEndpointsMap(previous)
 		ect.items[namespacedName] = change
 	}
-	if t := getLastChangeTriggerTime(endpoints); !t.IsZero() {
+	if t := getLastChangeTriggerTime(current); !t.IsZero() {
 		ect.lastChangeTriggerTimes[namespacedName] =
 			append(ect.lastChangeTriggerTimes[namespacedName], t)
 	}
+
 	change.current = ect.endpointsToEndpointsMap(current)
 	// if change.previous equal to change.current, it means no change
 	if reflect.DeepEqual(change.previous, change.current) {
@@ -154,6 +158,8 @@ func (ect *EndpointChangeTracker) Update(previous, current *v1.Endpoints) bool {
 		// should be exported.
 		delete(ect.lastChangeTriggerTimes, namespacedName)
 	}
+
+	metrics.EndpointChangesPending.Set(float64(len(ect.items)))
 	return len(ect.items) > 0
 }
 
@@ -161,6 +167,10 @@ func (ect *EndpointChangeTracker) Update(previous, current *v1.Endpoints) bool {
 // annotation stored in the given endpoints object or the "zero" time if the annotation wasn't set
 // or was set incorrectly.
 func getLastChangeTriggerTime(endpoints *v1.Endpoints) time.Time {
+	// TODO(#81360): ignore case when Endpoint is deleted.
+	if endpoints == nil {
+		return time.Time{}
+	}
 	if _, ok := endpoints.Annotations[v1.EndpointsLastChangeTriggerTime]; !ok {
 		// It's possible that the Endpoints object won't have the EndpointsLastChangeTriggerTime
 		// annotation set. In that case return the 'zero value', which is ignored in the upstream code.
@@ -193,22 +203,23 @@ type UpdateEndpointMapResult struct {
 	StaleServiceNames []ServicePortName
 	// List of the trigger times for all endpoints objects that changed. It's used to export the
 	// network programming latency.
-	LastChangeTriggerTimes []time.Time
+	// NOTE(oxddr): this can be simplified to []time.Time if memory consumption becomes an issue.
+	LastChangeTriggerTimes map[types.NamespacedName][]time.Time
 }
 
-// UpdateEndpointsMap updates endpointsMap base on the given changes.
-func UpdateEndpointsMap(endpointsMap EndpointsMap, changes *EndpointChangeTracker) (result UpdateEndpointMapResult) {
+// Update updates endpointsMap base on the given changes.
+func (em EndpointsMap) Update(changes *EndpointChangeTracker) (result UpdateEndpointMapResult) {
 	result.StaleEndpoints = make([]ServiceEndpoint, 0)
 	result.StaleServiceNames = make([]ServicePortName, 0)
-	result.LastChangeTriggerTimes = make([]time.Time, 0)
+	result.LastChangeTriggerTimes = make(map[types.NamespacedName][]time.Time)
 
-	endpointsMap.apply(
+	em.apply(
 		changes, &result.StaleEndpoints, &result.StaleServiceNames, &result.LastChangeTriggerTimes)
 
 	// TODO: If this will appear to be computationally expensive, consider
 	// computing this incrementally similarly to endpointsMap.
 	result.HCEndpointsLocalIPSize = make(map[types.NamespacedName]int)
-	localIPs := GetLocalEndpointIPs(endpointsMap)
+	localIPs := em.getLocalEndpointIPs()
 	for nsn, ips := range localIPs {
 		result.HCEndpointsLocalIPSize[nsn] = len(ips)
 	}
@@ -282,43 +293,49 @@ func (ect *EndpointChangeTracker) endpointsToEndpointsMap(endpoints *v1.Endpoint
 // The changes map is cleared after applying them.
 // In addition it returns (via argument) and resets the lastChangeTriggerTimes for all endpoints
 // that were changed and will result in syncing the proxy rules.
-func (endpointsMap EndpointsMap) apply(changes *EndpointChangeTracker, staleEndpoints *[]ServiceEndpoint,
-	staleServiceNames *[]ServicePortName, lastChangeTriggerTimes *[]time.Time) {
+func (em EndpointsMap) apply(changes *EndpointChangeTracker, staleEndpoints *[]ServiceEndpoint,
+	staleServiceNames *[]ServicePortName, lastChangeTriggerTimes *map[types.NamespacedName][]time.Time) {
 	if changes == nil {
 		return
 	}
 	changes.lock.Lock()
 	defer changes.lock.Unlock()
 	for _, change := range changes.items {
-		endpointsMap.Unmerge(change.previous)
-		endpointsMap.Merge(change.current)
+		em.unmerge(change.previous)
+		em.merge(change.current)
 		detectStaleConnections(change.previous, change.current, staleEndpoints, staleServiceNames)
 	}
 	changes.items = make(map[types.NamespacedName]*endpointsChange)
-	for _, lastChangeTriggerTime := range changes.lastChangeTriggerTimes {
-		*lastChangeTriggerTimes = append(*lastChangeTriggerTimes, lastChangeTriggerTime...)
+	metrics.EndpointChangesPending.Set(0)
+	for k, v := range changes.lastChangeTriggerTimes {
+		prev, ok := (*lastChangeTriggerTimes)[k]
+		if !ok {
+			(*lastChangeTriggerTimes)[k] = v
+		} else {
+			(*lastChangeTriggerTimes)[k] = append(prev, v...)
+		}
 	}
 	changes.lastChangeTriggerTimes = make(map[types.NamespacedName][]time.Time)
 }
 
 // Merge ensures that the current EndpointsMap contains all <service, endpoints> pairs from the EndpointsMap passed in.
-func (em EndpointsMap) Merge(other EndpointsMap) {
+func (em EndpointsMap) merge(other EndpointsMap) {
 	for svcPortName := range other {
 		em[svcPortName] = other[svcPortName]
 	}
 }
 
 // Unmerge removes the <service, endpoints> pairs from the current EndpointsMap which are contained in the EndpointsMap passed in.
-func (em EndpointsMap) Unmerge(other EndpointsMap) {
+func (em EndpointsMap) unmerge(other EndpointsMap) {
 	for svcPortName := range other {
 		delete(em, svcPortName)
 	}
 }
 
 // GetLocalEndpointIPs returns endpoints IPs if given endpoint is local - local means the endpoint is running in same host as kube-proxy.
-func GetLocalEndpointIPs(endpointsMap EndpointsMap) map[types.NamespacedName]sets.String {
+func (em EndpointsMap) getLocalEndpointIPs() map[types.NamespacedName]sets.String {
 	localIPs := make(map[types.NamespacedName]sets.String)
-	for svcPortName, epList := range endpointsMap {
+	for svcPortName, epList := range em {
 		for _, ep := range epList {
 			if ep.GetIsLocal() {
 				nsn := svcPortName.NamespacedName
